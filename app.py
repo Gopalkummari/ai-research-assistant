@@ -15,6 +15,13 @@ from src.rag.qa_chain import RAGEngine
 from src.rag.summarizer import DocumentSummarizer
 from src.rag.comparator import DocumentComparator
 from src.analytics.metrics import AnalyticsEngine
+from src.database.crud import delete_document_record
+
+def safe_rerun():
+    if hasattr(st, "rerun"):
+        st.rerun()
+    elif hasattr(st, "experimental_rerun"):
+        st.experimental_rerun()
 
 # Page configuration
 st.set_page_config(
@@ -109,6 +116,45 @@ if menu == "Document Management":
                 "Status": d.processing_status
             } for d in docs]
             st.dataframe(pd.DataFrame(doc_data), use_container_width=True)
+
+            st.markdown("---")
+            st.subheader("🗑️ Delete Saved Document")
+
+            doc_map = {f"{d.file_name} (Category: {d.category} | Chunks: {d.total_chunks}) [ID: {d.doc_id[:8]}]": d.doc_id for d in docs}
+            selected_doc_label = st.selectbox("Select Document to Delete", options=list(doc_map.keys()), key="delete_doc_select")
+
+            col_del, col_space = st.columns([2, 4])
+            with col_del:
+                if st.button("🗑️ Delete Selected Document", type="primary", key="btn_delete_selected_doc"):
+                    doc_id_to_del = doc_map[selected_doc_label]
+                    doc_obj = next((d for d in docs if d.doc_id == doc_id_to_del), None)
+                    doc_name = doc_obj.file_name if doc_obj else doc_id_to_del
+
+                    if delete_document_record(doc_id_to_del, db, vector_store):
+                        st.success(f"Successfully deleted document **{doc_name}**!")
+                        safe_rerun()
+                    else:
+                        st.error("Failed to delete document.")
+
+            st.markdown("#### Document Actions")
+            for doc in docs:
+                with st.expander(f"📄 {doc.file_name} — Category: {doc.category} (ID: {doc.doc_id[:8]}...)", expanded=False):
+                    c1, c2, c3 = st.columns([3, 3, 2])
+                    with c1:
+                        st.write(f"**Pages:** {doc.total_pages} | **Chunks:** {doc.total_chunks}")
+                        st.write(f"**Status:** {doc.processing_status}")
+                    with c2:
+                        st.write(f"**Uploaded:** {doc.upload_timestamp.strftime('%Y-%m-%d %H:%M') if doc.upload_timestamp else 'N/A'}")
+                        st.write(f"**Path:** `{doc.file_path}`")
+                    with c3:
+                        if st.button("🗑️ Delete Document", key=f"del_card_{doc.doc_id}", type="primary"):
+                            if delete_document_record(doc.doc_id, db, vector_store):
+                                st.success(f"Successfully deleted **{doc.file_name}**!")
+                                safe_rerun()
+                            else:
+                                st.error(f"Failed to delete **{doc.file_name}**.")
+        else:
+            st.info("No documents stored in the knowledge base yet.")
 
 elif menu == "RAG Question Answering":
     st.header("💬 Grounded Question Answering")

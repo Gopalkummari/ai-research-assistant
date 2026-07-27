@@ -110,22 +110,13 @@ def get_document(doc_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Document not found.")
     return doc
 
+from src.database.crud import delete_document_record
+
 @router.delete("/{doc_id}")
 def delete_document(doc_id: str, db: Session = Depends(get_db)):
-    doc = db.query(DocumentMetadata).filter(DocumentMetadata.doc_id == doc_id).first()
-    if not doc:
+    deleted = delete_document_record(doc_id, db, vector_store)
+    if not deleted:
         raise HTTPException(status_code=404, detail="Document not found.")
-
-    if os.path.exists(doc.file_path):
-        try:
-            os.remove(doc.file_path)
-        except Exception:
-            pass
-
-    vector_store.delete_document_chunks(doc_id)
-
-    db.delete(doc)
-    db.commit()
 
     return {"message": f"Document {doc_id} and associated vector embeddings successfully deleted."}
 
