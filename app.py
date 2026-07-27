@@ -33,6 +33,24 @@ rag_engine = RAGEngine(vector_store)
 summarizer = DocumentSummarizer(vector_store)
 comparator = DocumentComparator(vector_store)
 
+def sync_missing_chunks():
+    """Self-healing function to re-chunk any document missing chunks in SQLite."""
+    try:
+        from src.database.models import DocumentChunk
+        with SessionLocal() as db:
+            docs = db.query(DocumentMetadata).all()
+            for doc in docs:
+                chunk_count = db.query(DocumentChunk).filter(DocumentChunk.doc_id == doc.doc_id).count()
+                if chunk_count == 0 and doc.file_path and os.path.exists(doc.file_path):
+                    pages = pdf_parser.extract_pages(doc.file_path, doc.doc_id, doc.file_name)
+                    chunks = chunker.create_chunks(pages)
+                    if chunks:
+                        vector_store.add_chunks(chunks)
+    except Exception as e:
+        print(f"Sync missing chunks warning: {e}")
+
+sync_missing_chunks()
+
 # Header
 st.title("📚 AI Research & Knowledge Assistant")
 st.markdown("Enterprise-grade RAG Assistant for Document Processing, ML Domain Classification, Grounded Q&A with Citations, Summarization, and Analytics.")
@@ -40,8 +58,6 @@ st.markdown("Enterprise-grade RAG Assistant for Document Processing, ML Domain C
 # Sidebar Navigation
 st.sidebar.header("Navigation")
 menu = st.sidebar.radio("Select Module", ["Document Management", "RAG Question Answering", "Summarize & Compare", "System Analytics"])
-
-db = SessionLocal()
 
 if menu == "Document Management":
     st.header("📄 Upload & Ingest Documents")
@@ -63,42 +79,46 @@ if menu == "Document Management":
                 chunks = chunker.create_chunks(pages)
                 vector_store.add_chunks(chunks)
 
-                doc_record = DocumentMetadata(
-                    doc_id=doc_id,
-                    file_name=uploaded_file.name,
-                    file_path=save_path,
-                    upload_timestamp=datetime.utcnow(),
-                    total_pages=len(pages),
-                    total_chunks=len(chunks),
-                    processing_status="PROCESSED",
-                    category=predicted_category
-                )
-                db.add(doc_record)
-                db.commit()
+                with SessionLocal() as db:
+                    doc_record = DocumentMetadata(
+                        doc_id=doc_id,
+                        file_name=uploaded_file.name,
+                        file_path=save_path,
+                        upload_timestamp=datetime.utcnow(),
+                        total_pages=len(pages),
+                        total_chunks=len(chunks),
+                        processing_status="PROCESSED",
+                        category=predicted_category
+                    )
+                    db.add(doc_record)
+                    db.commit()
 
                 st.success(f"Successfully processed **{uploaded_file.name}**!")
                 st.info(f"**Pages:** {len(pages)} | **Chunks:** {len(chunks)} | **ML Category:** {predicted_category}")
 
     st.subheader("Indexed Knowledge Base Documents")
-    docs = db.query(DocumentMetadata).all()
-    if docs:
-        doc_data = [{
-            "Document ID": d.doc_id,
-            "File Name": d.file_name,
-            "Pages": d.total_pages,
-            "Chunks": d.total_chunks,
-            "Category": d.category,
-            "Status": d.processing_status
-        } for d in docs]
-        st.dataframe(pd.DataFrame(doc_data), use_container_width=True)
+    with SessionLocal() as db:
+        docs = db.query(DocumentMetadata).all()
+        if docs:
+            doc_data = [{
+                "Document ID": d.doc_id,
+                "File Name": d.file_name,
+                "Pages": d.total_pages,
+                "Chunks": d.total_chunks,
+                "Category": d.category,
+                "Status": d.processing_status
+            } for d in docs]
+            st.dataframe(pd.DataFrame(doc_data), use_container_width=True)
 
 elif menu == "RAG Question Answering":
     st.header("💬 Grounded Question Answering")
     
-    docs = db.query(DocumentMetadata).all()
+    with SessionLocal() as db:
+        docs = db.query(DocumentMetadata).all()
+    
     selected_doc_ids = []
     if docs:
-        doc_map = {f"{d.file_name} ({d.category})": d.doc_id for d in docs}
+        doc_map = {f"{d.file_name} [ID: {d.doc_id[:6]}] ({d.category})": d.doc_id for d in docs}
         selected = st.multiselect("Filter by Specific Document(s) (Optional)", list(doc_map.keys()))
         selected_doc_ids = [doc_map[s] for s in selected]
 
@@ -111,13 +131,21 @@ elif menu == "RAG Question Answering":
             st.write(result["answer"])
 
             st.markdown("### 📌 Citations")
-            for cit in result.get("citations", []):
-                st.caption(f"• **Document:** {cit['document']} | **Page:** {cit['page']}")
+            citations = result.get("citations", [])
+            if citations:
+                for cit in citations:
+                    st.caption(f"• **Document:** {cit['document']} | **Page:** {cit['page']}")
+            else:
+                st.info("No explicit document citations returned.")
 
             with st.expander("View Retrieved Context Snippets"):
-                for idx, ctx in enumerate(result.get("retrieved_context", [])):
-                    st.markdown(f"**Chunk {idx+1}:**")
-                    st.text(ctx)
+                retrieved = result.get("retrieved_context", [])
+                if retrieved:
+                    for idx, ctx in enumerate(retrieved):
+                        st.markdown(f"**Chunk {idx+1}:**")
+                        st.text(ctx)
+                else:
+                    st.write("No matching context chunks found.")
 
 elif menu == "Summarize & Compare":
     st.header("🔍 Summarization & Comparison Engine")
@@ -125,45 +153,73 @@ elif menu == "Summarize & Compare":
     sub_tab1, sub_tab2 = st.tabs(["Document Summary", "Multi-Document Comparison"])
 
     with sub_tab1:
-        docs = db.query(DocumentMetadata).all()
+        with SessionLocal() as db:
+            docs = db.query(DocumentMetadata).all()
         if docs:
-            doc_options = {d.file_name: d.doc_id for d in docs}
-            selected_name = st.selectbox("Select Document to Summarize", list(doc_options.keys()))
+            doc_options = {f"{d.file_name} [ID: {d.doc_id[:6]}]": d.doc_id for d in docs}
+            selected_label = st.selectbox("Select Document to Summarize", list(doc_options.keys()))
             if st.button("Generate Summary"):
-                doc_id = doc_options[selected_name]
+                doc_id = doc_options[selected_label]
+                selected_name = selected_label.split(" [ID:")[0]
                 summary = summarizer.summarize_document(doc_id, file_name=selected_name)
                 
-                st.markdown("### Executive Summary")
-                st.write(summary.get("executive_summary"))
+                st.markdown("### 📋 Executive Summary")
+                st.info(summary.get("executive_summary"))
 
-                st.markdown("### Technical Summary")
+                st.markdown("### ⚙️ Technical Summary")
                 st.write(summary.get("technical_summary"))
 
-                st.markdown("### Key Bullet Points")
+                st.markdown("### 📌 Key Bullet Points")
                 for bp in summary.get("bullet_points", []):
-                    st.write(f"• {bp}")
+                    st.markdown(f"• {bp}")
+
+                st.markdown("### 💡 Key Takeaways")
+                for kt in summary.get("key_takeaways", []):
+                    st.markdown(f"• {kt}")
 
     with sub_tab2:
-        docs = db.query(DocumentMetadata).all()
+        with SessionLocal() as db:
+            docs = db.query(DocumentMetadata).all()
         if docs and len(docs) >= 2:
-            doc_options = {d.file_name: d.doc_id for d in docs}
-            selected_names = st.multiselect("Select 2+ Documents to Compare", list(doc_options.keys()), default=list(doc_options.keys())[:2])
-            if st.button("Compare Documents") and len(selected_names) >= 2:
-                selected_ids = [doc_options[n] for n in selected_names]
+            doc_options = {f"{d.file_name} [ID: {d.doc_id[:6]}]": d.doc_id for d in docs}
+            selected_labels = st.multiselect("Select 2+ Documents to Compare", list(doc_options.keys()), default=list(doc_options.keys())[:2])
+            if st.button("Compare Documents") and len(selected_labels) >= 2:
+                selected_ids = [doc_options[n] for n in selected_labels]
+                selected_names = [n.split(" [ID:")[0] for n in selected_labels]
                 comp = comparator.compare_documents(selected_ids, doc_names=selected_names)
                 
-                st.markdown("### Similarities")
-                for sim in comp.get("similarities", []):
-                    st.write(f"• {sim}")
+                st.markdown("### 🔬 Methodology Comparison")
+                meth = comp.get("methodology_comparison", {})
+                if isinstance(meth, dict):
+                    for doc_n, m_desc in meth.items():
+                        st.markdown(f"**{doc_n}:** {m_desc}")
+                else:
+                    st.write(str(meth))
 
-                st.markdown("### Key Differences")
+                st.markdown("### 🤝 Similarities")
+                for sim in comp.get("similarities", []):
+                    st.markdown(f"• {sim}")
+
+                st.markdown("### ⚡ Key Differences")
                 for diff in comp.get("differences", []):
-                    st.write(f"• {diff}")
+                    st.markdown(f"• {diff}")
+
+                st.markdown("### 📊 Advantages & Characteristics")
+                adv = comp.get("advantages_disadvantages", {})
+                if isinstance(adv, dict):
+                    for doc_n, a_info in adv.items():
+                        st.markdown(f"**{doc_n}:**")
+                        if isinstance(a_info, dict):
+                            for adv_item in a_info.get("advantages", []):
+                                st.caption(f"  + Advantage: {adv_item}")
+                        else:
+                            st.caption(f"  {a_info}")
 
 elif menu == "System Analytics":
     st.header("📊 Knowledge Base System Analytics")
-    analytics = AnalyticsEngine(db, vector_store)
-    stats = analytics.get_system_stats()
+    with SessionLocal() as db:
+        analytics = AnalyticsEngine(db, vector_store)
+        stats = analytics.get_system_stats()
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Total Documents", stats.get("total_documents", 0))
@@ -174,4 +230,3 @@ elif menu == "System Analytics":
     st.markdown("### Category Distribution")
     st.bar_chart(stats.get("category_distribution", {}))
 
-db.close()

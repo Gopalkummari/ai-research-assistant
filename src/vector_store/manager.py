@@ -116,59 +116,94 @@ class VectorStoreManager:
         self._reload_memory_from_db()
 
         if self.collection and self.collection.count() > 0:
-            where_filter = None
-            if doc_ids:
-                if len(doc_ids) == 1:
-                    where_filter = {"doc_id": doc_ids[0]}
-                else:
-                    where_filter = {"$or": [{"doc_id": did} for did in doc_ids]}
+            try:
+                where_filter = None
+                if doc_ids:
+                    if len(doc_ids) == 1:
+                        where_filter = {"doc_id": doc_ids[0]}
+                    else:
+                        where_filter = {"$or": [{"doc_id": did} for did in doc_ids]}
 
-            results = self.collection.query(
-                query_texts=[query],
-                n_results=top_k,
-                where=where_filter
-            )
+                results = self.collection.query(
+                    query_texts=[query],
+                    n_results=min(top_k, self.collection.count()),
+                    where=where_filter
+                )
 
-            formatted_results = []
-            if results and results["documents"]:
-                docs = results["documents"][0]
-                metas = results["metadatas"][0]
-                distances = results["distances"][0] if "distances" in results and results["distances"] else [0.0]*len(docs)
+                formatted_results = []
+                if results and results.get("documents") and len(results["documents"]) > 0:
+                    docs = results["documents"][0]
+                    metas = results["metadatas"][0] if "metadatas" in results and results["metadatas"] else [{}]*len(docs)
+                    distances = results["distances"][0] if "distances" in results and results["distances"] else [0.0]*len(docs)
 
-                for doc_text, meta, dist in zip(docs, metas, distances):
-                    score = round(max(0.0, 1.0 - float(dist)), 4)
-                    formatted_results.append({
-                        "text": doc_text,
-                        "file_name": meta.get("file_name", "Unknown"),
-                        "doc_id": meta.get("doc_id", "Unknown"),
-                        "page_number": meta.get("page_number", 1),
-                        "score": score
-                    })
+                    for doc_text, meta, dist in zip(docs, metas, distances):
+                        score = round(max(0.0, 1.0 - float(dist)), 4)
+                        formatted_results.append({
+                            "text": doc_text,
+                            "file_name": meta.get("file_name", "Unknown"),
+                            "doc_id": meta.get("doc_id", "Unknown"),
+                            "page_number": meta.get("page_number", 1),
+                            "score": score
+                        })
 
-            if formatted_results:
-                return formatted_results
+                if formatted_results:
+                    return formatted_results
+            except Exception as e:
+                print(f"ChromaDB search warning/error: {e}")
 
-        # Memory / SQLite text search fallback
-        query_terms = [t.lower() for t in query.split() if len(t) > 1]
+        # Memory / SQLite TF-IDF Vector Search Fallback
         candidates = self._memory_chunks if hasattr(self, "_memory_chunks") else []
         if doc_ids:
             candidates = [c for c in candidates if c.get("doc_id") in doc_ids]
 
-        scored = []
-        for c in candidates:
-            text_lower = c.get("text", "").lower()
-            matches = sum(1 for term in query_terms if term in text_lower)
-            score = round(matches / max(1, len(query_terms)), 4) if query_terms else 0.5
-            scored.append({
-                "text": c.get("text", ""),
-                "file_name": c.get("file_name", "Unknown"),
-                "doc_id": c.get("doc_id", "Unknown"),
-                "page_number": c.get("page_number", 1),
-                "score": max(score, 0.5)
-            })
+        if not candidates:
+            return []
 
-        scored.sort(key=lambda x: x["score"], reverse=True)
-        return scored[:top_k]
+        # Use scikit-learn TF-IDF for semantic ranking if candidate text is present
+        try:
+            from sklearn.feature_extraction.text import TfidfVectorizer
+            from sklearn.metrics.pairwise import cosine_similarity
+
+            corpus = [c.get("text", "") for c in candidates]
+            vectorizer = TfidfVectorizer(stop_words='english')
+            tfidf_matrix = vectorizer.fit_transform(corpus + [query])
+            
+            doc_vectors = tfidf_matrix[:-1]
+            query_vector = tfidf_matrix[-1]
+
+            sim_scores = cosine_similarity(query_vector, doc_vectors).flatten()
+
+            scored = []
+            for idx, c in enumerate(candidates):
+                score = round(float(sim_scores[idx]), 4)
+                scored.append({
+                    "text": c.get("text", ""),
+                    "file_name": c.get("file_name", "Unknown"),
+                    "doc_id": c.get("doc_id", "Unknown"),
+                    "page_number": c.get("page_number", 1),
+                    "score": max(score, 0.1)
+                })
+
+            scored.sort(key=lambda x: x["score"], reverse=True)
+            return scored[:top_k]
+        except Exception:
+            # Fallback simple keyword match
+            query_terms = [t.lower() for t in query.split() if len(t) > 1]
+            scored = []
+            for c in candidates:
+                text_lower = c.get("text", "").lower()
+                matches = sum(1 for term in query_terms if term in text_lower)
+                score = round(matches / max(1, len(query_terms)), 4) if query_terms else 0.5
+                scored.append({
+                    "text": c.get("text", ""),
+                    "file_name": c.get("file_name", "Unknown"),
+                    "doc_id": c.get("doc_id", "Unknown"),
+                    "page_number": c.get("page_number", 1),
+                    "score": max(score, 0.1)
+                })
+
+            scored.sort(key=lambda x: x["score"], reverse=True)
+            return scored[:top_k]
 
     def keyword_search(self, query: str, top_k: int = 4, doc_ids: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         return self.semantic_search(query, top_k=top_k, doc_ids=doc_ids)
