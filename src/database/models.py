@@ -14,6 +14,15 @@ class DocumentMetadata(Base):
     processing_status = Column(String, default="PENDING")  # PENDING, PROCESSING, PROCESSED, FAILED
     category = Column(String, default="Unclassified")
 
+class DocumentChunk(Base):
+    __tablename__ = "document_chunks"
+
+    id = Column(String, primary_key=True, index=True)
+    doc_id = Column(String, index=True, nullable=False)
+    file_name = Column(String, nullable=False)
+    page_number = Column(Integer, default=1)
+    chunk_text = Column(Text, nullable=False)
+
 class ChatSession(Base):
     __tablename__ = "chat_sessions"
 

@@ -21,18 +21,15 @@ class RAGEngine:
         """
         Retrieves top relevant chunks and generates a grounded response with page/file citations.
         """
-        # Resolve query if conversational context exists
         effective_query = query
         if chat_history and len(chat_history) > 0:
             last_turn = chat_history[-1]
             last_q = last_turn.get("user", "")
-            last_a = last_turn.get("assistant", "")
-            # If query contains pronouns like 'it', 'its', 'this paper', append previous context hint
             pronouns = ["its", "it", "this paper", "the paper", "these", "their"]
             if any(p in query.lower().split() for p in pronouns):
                 effective_query = f"{last_q} {query}"
 
-        # Retrieve relevant chunks from vector database
+        # Retrieve relevant chunks
         retrieved_chunks = self.vector_store.hybrid_search(
             query=effective_query,
             top_k=top_k,
@@ -47,7 +44,6 @@ class RAGEngine:
                 "confidence_score": 0.0
             }
 
-        # Build context string and citations array
         context_blocks = []
         citations = []
         scores = []
@@ -58,41 +54,40 @@ class RAGEngine:
             text_content = chunk.get("text", "")
             score = chunk.get("score", 0.0)
 
-            context_blocks.append(f"--- Source: {doc_name} (Page {page_no}) ---\n{text_content}")
-            citations.append({
-                "document": doc_name,
-                "page": page_no,
-                "doc_id": chunk.get("doc_id", "Unknown")
-            })
-            scores.append(score)
+            if text_content and text_content.strip():
+                context_blocks.append(f"--- Source: {doc_name} (Page {page_no}) ---\n{text_content}")
+                citations.append({
+                    "document": doc_name,
+                    "page": page_no,
+                    "doc_id": chunk.get("doc_id", "Unknown")
+                })
+                scores.append(score)
 
-        avg_confidence = round(sum(scores) / len(scores), 4) if scores else 0.0
-
-        # Check if context score is too low
-        if avg_confidence < 0.15:
+        if not context_blocks:
             return {
                 "answer": FALLBACK_MESSAGE,
                 "citations": [],
-                "retrieved_context": [c["text"] for c in retrieved_chunks],
-                "confidence_score": avg_confidence
+                "retrieved_context": [],
+                "confidence_score": 0.0
             }
 
-        # Attempt to synthesize response using OpenAI API if available, else local RAG synthesis engine
+        avg_confidence = round(sum(scores) / len(scores), 4) if scores else 0.5
+
         combined_context = "\n\n".join(context_blocks)
         answer = self._generate_response(query, combined_context, chat_history)
 
         return {
             "answer": answer,
             "citations": citations,
-            "retrieved_context": [c["text"] for c in retrieved_chunks],
+            "retrieved_context": [c["text"] for c in retrieved_chunks if c.get("text")],
             "confidence_score": avg_confidence
         }
 
     def _generate_response(self, query: str, context: str, chat_history: Optional[List[Dict[str, str]]]) -> str:
         """
-        Synthesizes response using OpenAI API if key exists, or rule-based intelligent contextual synthesis.
+        Synthesizes response using OpenAI API if key exists, or local grounded RAG synthesizer.
         """
-        if settings.OPENAI_API_KEY and settings.OPENAI_API_KEY.strip():
+        if settings.OPENAI_API_KEY and settings.OPENAI_API_KEY.strip() and not settings.OPENAI_API_KEY.startswith("your_"):
             try:
                 headers = {
                     "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
@@ -103,8 +98,8 @@ class RAGEngine:
                     history_str = "\n".join([f"User: {h.get('user', '')}\nAssistant: {h.get('assistant', '')}" for h in chat_history])
 
                 system_prompt = (
-                    "You are an AI Research & Knowledge Assistant. Answer the question based ONLY on the provided context.\n"
-                    "If the context does not contain sufficient details to answer, reply exactly: 'I cannot determine the answer from the provided documents.'\n"
+                    "You are an AI Research & Knowledge Assistant. Answer the user's question based ONLY on the provided document context below.\n"
+                    "If the context does not contain sufficient information to answer, state clearly: 'I cannot determine the answer from the provided documents.'\n"
                     "Always mention source document names and page numbers in your response."
                 )
                 user_prompt = f"History:\n{history_str}\n\nContext:\n{context}\n\nQuestion: {query}"
@@ -122,7 +117,7 @@ class RAGEngine:
                 if res.status_code == 200:
                     return res.json()["choices"][0]["message"]["content"].strip()
             except Exception as e:
-                print(f"LLM API call failed: {e}. Falling back to local RAG synthesis.")
+                print(f"LLM API call error: {e}")
 
         # Local Grounded RAG Synthesizer
         lines = [line.strip() for line in context.split("\n") if line.strip() and not line.startswith("--- Source:")]
